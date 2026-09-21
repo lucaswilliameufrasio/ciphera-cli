@@ -1,0 +1,135 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main, auto, canary]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'SECURITY.md'
+      - 'LICENSE'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+      - 'SECURITY.md'
+      - 'LICENSE'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: -D warnings
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust 1.97.0 with lint components
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.0
+          components: rustfmt, clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+
+      - name: Lint (rustfmt)
+        run: cargo fmt --all --check
+
+      - name: Lint (installer script syntax)
+        run: sh -n scripts/install.sh
+
+      - name: Lint (clippy)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  build-and-test:
+    name: Build and test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.0
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Run tests
+        run: cargo nextest run --locked --all-targets
+
+      - name: Check branch naming convention
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        shell: bash
+        run: |
+          branch="${{ github.head_ref }}"
+          if [[ "$branch" =~ ^(feature|bugfix)/(issue-[0-9]+[-_a-zA-Z0-9]+|[-_a-zA-Z0-9]+)$ ]] || [[ "$branch" =~ ^release/v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "Branch name '$branch' OK"
+          else
+            echo "::error title=Branch name::Branch '$branch' does not match pattern: <feature|bugfix>/[issue-<number>-]<description>"
+            exit 1
+          fi
+
+      - name: Check CHANGELOG updated
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          changed="$(git diff --name-only "$base".."$head" | grep -c 'CHANGELOG\.md' || true)"
+          code_changed="$(git diff --name-only "$base".."$head" | grep -cE '\.rs$|Cargo\.toml$|Cargo\.lock$' || true)"
+          if [ "$code_changed" -gt 0 ] && [ "$changed" -eq 0 ]; then
+            echo "::warning title=CHANGELOG::CHANGELOG.md was not updated in this PR."
+          fi
+
+  docs:
+    name: Build docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust 1.97.0
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.97.0
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+
+      - name: Build rustdoc
+        run: cargo doc --locked --no-deps
