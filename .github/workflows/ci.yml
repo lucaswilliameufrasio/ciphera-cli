@@ -89,8 +89,11 @@ jobs:
       - name: Build
         run: cargo build --locked --all-targets
 
+      # cli_api's device-login tests exercise the real OS keyring, which
+      # isn't available on a headless CI runner (matches the scoping the
+      # private ciphera repo's own CI uses for these crates).
       - name: Run tests
-        run: cargo nextest run --locked --all-targets
+        run: cargo nextest run --locked --lib --bins
 
       - name: Check branch naming convention
         if: github.event_name == 'pull_request' && github.base_ref == 'main'
