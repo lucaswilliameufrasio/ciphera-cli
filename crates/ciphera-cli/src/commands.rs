@@ -652,6 +652,117 @@ pub async fn handle_devices_deny(api_url: &str, token: &str, id: &str) -> Result
     }
 }
 
+/// `ciphera doctor`: checks API reachability, whether a token can be
+/// resolved (env/flag/keyring) and is still valid, and whether the OS
+/// keyring backend works. Prints a short pass/fail list; returns `Err` (so
+/// the CLI exits non-zero) if any critical check failed.
+pub async fn handle_doctor(api_url: &str, cli_token: Option<String>) -> Result<(), String> {
+    let mut critical_failure = false;
+    let client = Client::new();
+
+    println!("Ciphera doctor\n");
+
+    // 1. API reachability.
+    print!("[ ] API reachable at {api_url} ... ");
+    match client.get(format!("{}/health", api_url)).send().await {
+        Ok(resp) if resp.status().is_success() => println!("\r[ok] API reachable at {api_url}"),
+        Ok(resp) => {
+            println!("\r[FAIL] API at {api_url} responded with {}", resp.status());
+            critical_failure = true;
+        }
+        Err(e) => {
+            println!("\r[FAIL] API at {api_url} is unreachable: {e}");
+            critical_failure = true;
+        }
+    }
+
+    // 2. Token resolution (env / --token / keyring).
+    let token = match crate::resolve_token(cli_token) {
+        Ok(t) => {
+            println!("[ok] Auth token resolved (--token, CIPHERA_TOKEN, or OS Keyring)");
+            Some(t)
+        }
+        Err(e) => {
+            println!("[FAIL] No auth token resolvable: {e}");
+            critical_failure = true;
+            None
+        }
+    };
+
+    // 3. Token validity, for both session (user) and machine (service)
+    // tokens. `/v1/auth/me` 200s for a valid session token; it 403s with a
+    // specific message for a *valid* machine token (which has no user
+    // profile) — so both are "valid", only an actual 401 means the token
+    // itself is bad.
+    if let Some(token) = &token {
+        let response = client
+            .get(format!("{}/v1/auth/me", api_url))
+            .bearer_auth(token)
+            .send()
+            .await;
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let user: Result<ciphera_core::auth::AuthUser, _> = resp.json().await;
+                match user {
+                    Ok(u) => println!(
+                        "[ok] Token is valid (signed in as {}, role: {})",
+                        u.email, u.tenant_role
+                    ),
+                    Err(_) => println!("[ok] Token is valid (session)"),
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                if body["error_code"].as_str() == Some("FORBIDDEN") {
+                    println!("[ok] Token is valid (machine/service token)");
+                } else {
+                    println!(
+                        "[FAIL] Token rejected: {}",
+                        body["message"].as_str().unwrap_or("forbidden")
+                    );
+                    critical_failure = true;
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                println!("[FAIL] Token is invalid or expired");
+                critical_failure = true;
+            }
+            Ok(resp) => {
+                println!(
+                    "[FAIL] Unexpected response checking token validity: {}",
+                    resp.status()
+                );
+                critical_failure = true;
+            }
+            Err(e) => {
+                println!("[FAIL] Could not check token validity: {e}");
+                critical_failure = true;
+            }
+        }
+    } else {
+        println!("[--] Skipped token validity check (no token resolvable)");
+    }
+
+    // 4. OS keyring backend availability. Not critical: CIPHERA_TOKEN/--token
+    // work fine without it.
+    match Entry::new("ciphera", "doctor_probe") {
+        Ok(entry) => match entry.get_password() {
+            Ok(_) => println!("[ok] OS Keyring backend is available"),
+            Err(keyring::Error::NoEntry) => println!("[ok] OS Keyring backend is available"),
+            Err(e) => println!("[warn] OS Keyring backend may be unavailable: {e}"),
+        },
+        Err(e) => println!("[warn] OS Keyring backend is unavailable: {e}"),
+    }
+
+    println!();
+    if critical_failure {
+        Err("One or more critical checks failed.".to_string())
+    } else {
+        println!("All critical checks passed.");
+        Ok(())
+    }
+}
+
 pub async fn handle_devices_require_approval(
     api_url: &str,
     token: &str,

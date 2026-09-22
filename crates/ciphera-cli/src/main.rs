@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod env_parser;
 mod interactive;
+mod mcp;
 mod uploader;
 
 /// Best-effort hostname for the default device label; falls back to a
@@ -18,9 +19,21 @@ use clap::{Parser, Subcommand};
 use keyring::Entry;
 use std::env;
 
+fn cli_styles() -> clap::builder::Styles {
+    use clap::builder::styling::AnsiColor;
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Yellow.on_default().bold())
+        .usage(AnsiColor::Yellow.on_default().bold())
+        .literal(AnsiColor::Green.on_default().bold())
+        .placeholder(AnsiColor::Cyan.on_default())
+        .error(AnsiColor::Red.on_default().bold())
+        .valid(AnsiColor::Green.on_default())
+        .invalid(AnsiColor::Yellow.on_default())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "ciphera")]
-#[command(about = "Ciphera Secret Management System CLI", version)]
+#[command(about = "Ciphera Secret Management System CLI", version, styles = cli_styles())]
 struct Cli {
     #[arg(
         long,
@@ -41,6 +54,23 @@ enum Commands {
     /// Authenticate via the browser (device flow) and save tokens
     /// securely into the OS Keyring. Alternatively pass --token, or
     /// --email and --password, to log in without the browser.
+    #[command(long_about = "\
+Authenticate via the browser (RFC 8628 device flow) and save the resulting \
+session tokens securely into the OS Keyring. Alternatively pass --token \
+(an existing session or service token) or --email/--password to log in \
+without opening a browser.
+
+Examples:
+  ciphera login                         # opens a browser, polls until approved
+  ciphera login --device-name my-laptop
+  ciphera login --email a@b.com --password '...'
+  ciphera login --token <existing-token>
+
+IMPORTANT: this device flow is for a human authenticating interactively at \
+a keyboard. It must never be scripted or run unattended on a server, in CI, \
+or inside a container — it opens a browser and waits for a person to click \
+through it. For any non-interactive context, use a scoped machine token \
+instead: `ciphera token create` (see `ciphera token create --help`).")]
     Login {
         #[arg(long)]
         token: Option<String>,
@@ -64,6 +94,14 @@ enum Commands {
     Logout,
 
     /// Initialize local ciphera.toml configuration file
+    #[command(long_about = "\
+Write a local ciphera.toml recording the project id (and, optionally, a \
+default environment) so other commands (`ciphera run`, `ciphera import`, \
+`ciphera token create`, ...) don't need --project/--env on every invocation.
+
+Examples:
+  ciphera init --project proj_abc123
+  ciphera init --project proj_abc123 --env staging")]
     Init {
         #[arg(short, long)]
         project: String,
@@ -133,6 +171,20 @@ enum Commands {
     },
 
     /// Inject secrets into environment and execute target command
+    #[command(long_about = "\
+Fetch every secret in a project/environment and exec the given command with \
+them injected as environment variables. On Unix the child process replaces \
+this one (exec), so secrets never sit in an intermediate shell's environment \
+longer than necessary.
+
+Examples:
+  ciphera run -- npm start
+  ciphera run --project proj_abc123 --env production -- ./server
+  ciphera run --env staging -- docker compose up
+
+Avoid redirecting this command's output to a file or a non-exec pipe \
+(e.g. `ciphera run -- env > out.txt`) — that can leave decrypted values on \
+disk or in a log. Let it exec the target process directly.")]
     Run {
         #[arg(short, long)]
         project: Option<String>,
@@ -150,6 +202,66 @@ enum Commands {
         #[command(subcommand)]
         command: DeviceCommands,
     },
+
+    /// Metadata-only MCP server for AI coding assistants, plus its installer
+    #[command(long_about = "\
+Metadata-only Model Context Protocol server (`ciphera mcp serve`) and its \
+installer for AI coding assistants. No tool this server exposes ever \
+returns a decrypted secret value — it can list projects, environments, key \
+names, tokens, pending device approvals, and the audit log, and it can \
+create scoped machine tokens, but it cannot read a secret's value. That's a \
+structural guarantee: there is no get_secret_value/reveal_secret tool.
+
+  ciphera mcp serve      Run the server over stdio (usually launched by an
+                          AI tool, not invoked directly)
+  ciphera mcp install    Wire the server + a defense-in-depth guard hook
+                          into Claude Code (.mcp.json, .claude/settings.json)
+  ciphera mcp uninstall  Remove exactly what `install` added
+")]
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+
+    /// Check API reachability, auth, and keyring availability
+    Doctor,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCommands {
+    /// Run the metadata-only MCP server over stdio
+    Serve,
+
+    /// Wire the MCP server and guard hook into Claude Code (and print the
+    /// equivalent config for other AI tools)
+    Install {
+        /// Print what would change without writing any files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip interactive confirmation prompts (e.g. the opencode secret
+        /// migration)
+        #[arg(short, long)]
+        yes: bool,
+
+        /// Ciphera project id to store secrets found in an opencode config
+        /// (Phase C1). Prompted for interactively if omitted and stdin is a
+        /// TTY.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Environment to store those secrets in
+        #[arg(long)]
+        env: Option<String>,
+    },
+
+    /// Remove exactly what `ciphera mcp install` added
+    Uninstall,
+
+    /// Hidden: PreToolUse hook classifier invoked by Claude Code, not by
+    /// hand. Reads the hook payload from stdin.
+    #[command(hide = true)]
+    Guard,
 }
 
 #[derive(Subcommand, Debug)]
@@ -207,6 +319,21 @@ enum SecretCommands {
 #[derive(Subcommand, Debug)]
 enum TokenCommands {
     /// Create a service token for machine authentication
+    #[command(long_about = "\
+Create a scoped, expiring machine (service) token. This is the correct \
+credential for CI/CD, a VPS, a container, or any other non-interactive \
+context — never `ciphera login`'s device flow, which is for a human at a \
+keyboard and must not be scripted.
+
+Machine tokens always expire (--ttl-days, default 30, capped at 90 by the \
+server) and can optionally be locked to specific source IPs \
+(--allow-cidr, repeatable) for defense-in-depth if the caller's egress IP \
+is known and stable.
+
+Examples:
+  ciphera token create --name ci-deploy --env production
+  ciphera token create --name vps-app --env production --ttl-days 90 \\
+      --allow-cidr 203.0.113.4/32")]
     Create {
         #[arg(short, long)]
         name: String,
@@ -229,7 +356,7 @@ enum TokenCommands {
     },
 }
 
-fn resolve_token(cli_token: Option<String>) -> Result<String, String> {
+pub(crate) fn resolve_token(cli_token: Option<String>) -> Result<String, String> {
     if let Some(t) = cli_token {
         return Ok(t);
     }
@@ -359,6 +486,30 @@ async fn main() {
             },
             Err(e) => Err(e),
         },
+        Commands::Mcp { command } => match command {
+            McpCommands::Serve => match resolve_token(cli.token) {
+                Ok(token) => mcp::serve(api_url, token).await,
+                Err(e) => Err(e),
+            },
+            McpCommands::Install {
+                dry_run,
+                yes,
+                project,
+                env,
+            } => match mcp::install::install(dry_run) {
+                Ok(()) if dry_run => Ok(()),
+                Ok(()) => match resolve_token(cli.token) {
+                    Ok(token) => {
+                        mcp::install::migrate_opencode(&api_url, &token, project, env, yes).await
+                    }
+                    Err(_) => Ok(()), // no ciphera auth yet: skip the opencode migration silently
+                },
+                Err(e) => Err(e),
+            },
+            McpCommands::Uninstall => mcp::install::uninstall(),
+            McpCommands::Guard => mcp::guard::run(),
+        },
+        Commands::Doctor => commands::handle_doctor(&api_url, cli.token).await,
     };
 
     if let Err(e) = result {
