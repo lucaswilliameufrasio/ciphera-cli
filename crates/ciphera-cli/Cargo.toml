@@ -3,6 +3,11 @@ name = "ciphera-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Ciphera CLI — official client for the Ciphera secret management system"
+repository = "https://github.com/lucaswilliameufrasio/ciphera-cli"
+license = "MIT"
+authors = ["Lucas Eufrasio"]
+default-run = "ciphera"
 
 [[bin]]
 name = "ciphera"

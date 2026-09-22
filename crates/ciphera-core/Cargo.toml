@@ -3,6 +3,10 @@ name = "ciphera-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Shared DTOs and auth types for the Ciphera CLI"
+repository = "https://github.com/lucaswilliameufrasio/ciphera-cli"
+license = "MIT"
+publish = false
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
