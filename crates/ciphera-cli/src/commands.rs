@@ -6,8 +6,9 @@ use crate::env_parser::parse_env_file;
 use crate::uploader::Uploader;
 use ciphera_core::auth::AuthTokens;
 use ciphera_core::{
-    AuditLogItem, CreateProjectRequest, CreateProjectResponse, CreateTokenRequest,
-    CreateTokenResponse, RollbackRequest, SecretOutput,
+    AuditLogItem, CreateOidcTrustPolicyRequest, CreateProjectRequest, CreateProjectResponse,
+    CreateTokenRequest, CreateTokenResponse, OidcTokenExchangeRequest, OidcTrustPolicyInfo,
+    RollbackRequest, SecretOutput,
 };
 use keyring::Entry;
 use reqwest::Client;
@@ -433,6 +434,185 @@ pub async fn handle_token_create(
     } else {
         let err_text = response.text().await.unwrap_or_default();
         Err(format!("Failed to create token: {}", err_text))
+    }
+}
+
+/// Parses repeatable `--claim key=value` flags into a JSON object suitable
+/// for `CreateOidcTrustPolicyRequest::claims_matcher`.
+fn parse_claims(raw: &[String]) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut map = serde_json::Map::new();
+    for entry in raw {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("Invalid --claim '{entry}': expected key=value"))?;
+        if key.is_empty() {
+            return Err(format!("Invalid --claim '{entry}': key must not be empty"));
+        }
+        map.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+    Ok(map)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_oidc_policy_create(
+    api_url: &str,
+    token: &str,
+    issuer: &str,
+    audience: &str,
+    claims: &[String],
+    cli_project: Option<String>,
+    cli_env: Option<String>,
+    ttl_seconds: i64,
+    allowed_cidrs: Vec<String>,
+) -> Result<(), String> {
+    let claims_matcher = parse_claims(claims)?;
+    let (project_id, environment) = resolve_context(api_url, token, cli_project, cli_env).await?;
+
+    let client = Client::new();
+    let url = format!("{}/v1/projects/{}/oidc-policies", api_url, project_id);
+
+    let response = client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&CreateOidcTrustPolicyRequest {
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            claims_matcher,
+            environment,
+            ttl_seconds,
+            allowed_cidrs,
+        })
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if response.status().is_success() {
+        let policy: OidcTrustPolicyInfo = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        println!("OIDC trust policy created!");
+        println!("  ID:       {}", policy.id);
+        println!("  Issuer:   {}", policy.issuer);
+        println!("  Audience: {}", policy.audience);
+        println!(
+            "\nAny token from this issuer, matching this audience and every --claim, can now be \
+exchanged via `ciphera token oidc-exchange` for a service token scoped to project {} / env {}.",
+            project_id, policy.environment
+        );
+        Ok(())
+    } else {
+        let err_text = response.text().await.unwrap_or_default();
+        Err(format!("Failed to create OIDC trust policy: {}", err_text))
+    }
+}
+
+pub async fn handle_oidc_policy_list(
+    api_url: &str,
+    token: &str,
+    cli_project: Option<String>,
+) -> Result<(), String> {
+    let (project_id, _environment) = resolve_context(api_url, token, cli_project, None).await?;
+
+    let client = Client::new();
+    let url = format!("{}/v1/projects/{}/oidc-policies", api_url, project_id);
+
+    let response = client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if response.status().is_success() {
+        let policies: Vec<OidcTrustPolicyInfo> = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        if policies.is_empty() {
+            println!("No OIDC trust policies registered for this project.");
+            return Ok(());
+        }
+        for policy in policies {
+            let status = if policy.revoked_at.is_some() {
+                "revoked"
+            } else {
+                "active"
+            };
+            println!(
+                "{}  [{}]  aud={}  env={}  issuer={}",
+                policy.id, status, policy.audience, policy.environment, policy.issuer
+            );
+        }
+        Ok(())
+    } else {
+        let err_text = response.text().await.unwrap_or_default();
+        Err(format!("Failed to list OIDC trust policies: {}", err_text))
+    }
+}
+
+pub async fn handle_oidc_policy_revoke(
+    api_url: &str,
+    token: &str,
+    cli_project: Option<String>,
+    policy_id: &str,
+) -> Result<(), String> {
+    let (project_id, _environment) = resolve_context(api_url, token, cli_project, None).await?;
+
+    let client = Client::new();
+    let url = format!(
+        "{}/v1/projects/{}/oidc-policies/{}",
+        api_url, project_id, policy_id
+    );
+
+    let response = client
+        .delete(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if response.status().is_success() {
+        println!("OIDC trust policy {} revoked.", policy_id);
+        Ok(())
+    } else {
+        let err_text = response.text().await.unwrap_or_default();
+        Err(format!("Failed to revoke OIDC trust policy: {}", err_text))
+    }
+}
+
+/// Exchanges an externally-signed OIDC token (e.g. from CI/CD) for a
+/// Ciphera service token, per a registered trust policy. Not
+/// session-authenticated: the OIDC token itself is the credential.
+pub async fn handle_oidc_exchange(api_url: &str, oidc_token: &str) -> Result<(), String> {
+    let client = Client::new();
+    let url = format!("{}/v1/oidc/token", api_url);
+
+    let response = client
+        .post(&url)
+        .json(&OidcTokenExchangeRequest {
+            token: oidc_token.to_string(),
+        })
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if response.status().is_success() {
+        let token_resp: CreateTokenResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        println!("Service token successfully issued via OIDC exchange!");
+        println!("  Environment: {}", token_resp.environment);
+        println!("  Token:       {}", token_resp.token);
+        println!("\nIMPORTANT: Save this token now. It will not be displayed again.");
+        Ok(())
+    } else {
+        let err_text = response.text().await.unwrap_or_default();
+        Err(format!("OIDC token exchange failed: {}", err_text))
     }
 }
 

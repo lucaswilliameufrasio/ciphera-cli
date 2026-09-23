@@ -29,6 +29,35 @@ async fn fetch_projects(api_url: &str, token: &str) -> Result<Vec<ProjectInfo>, 
         .map_err(|e| format!("Failed to parse projects response: {}", e))
 }
 
+/// Resolve a project name to its UUID, while continuing to accept UUIDs
+/// directly for non-interactive use and existing config files.
+pub async fn resolve_project(api_url: &str, token: &str, project: &str) -> Result<String, String> {
+    if uuid::Uuid::parse_str(project).is_ok() {
+        return Ok(project.to_string());
+    }
+
+    let projects = fetch_projects(api_url, token).await?;
+    let matches: Vec<&ProjectInfo> = projects
+        .iter()
+        .filter(|candidate| candidate.name == project)
+        .collect();
+
+    match matches.as_slice() {
+        [matched] => Ok(matched.id.clone()),
+        [] => Err(format!(
+            "No project named '{project}' found. Use its UUID with --project, or choose one of: {}",
+            projects
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => Err(format!(
+            "More than one project is named '{project}'. Use the project UUID with --project."
+        )),
+    }
+}
+
 /// Fallback interativo quando nenhum projeto foi especificado
 /// (flag, env `CIPHERA_PROJECT_ID` ou `ciphera.toml`).
 ///

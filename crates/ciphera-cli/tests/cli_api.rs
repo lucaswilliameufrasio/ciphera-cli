@@ -20,7 +20,7 @@ use axum::{
 
 type Store = Arc<Mutex<Vec<(String, String)>>>;
 
-const PROJECT_ID: &str = "proj_00000000-0000-0000-0000-000000000001";
+const PROJECT_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 async fn record(store: axum::extract::State<Store>, req: Request<Body>, next: Next) -> Response {
     store
@@ -37,7 +37,14 @@ async fn start_mock() -> (String, Store) {
     let app = Router::new()
         .route(
             "/v1/projects",
-            post(|| async {
+            get(|| async {
+                Json(serde_json::json!([{
+                    "id": PROJECT_ID,
+                    "name": "ai-memory-tirion",
+                    "created_at": "2026-08-26T00:00:00Z"
+                }]))
+            })
+            .post(|| async {
                 (
                     StatusCode::CREATED,
                     Json(serde_json::json!({
@@ -401,12 +408,13 @@ async fn project_create_audit_rollback_delete_token() {
             "--name",
             "ci",
             "--project",
-            PROJECT_ID,
+            "ai-memory-tirion",
             "--env",
             "development",
         ],
     );
     assert_recorded(&store, "POST", &format!("/v1/projects/{PROJECT_ID}/tokens"));
+    assert_recorded(&store, "GET", "/v1/projects");
 }
 
 #[tokio::test]

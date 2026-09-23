@@ -156,6 +156,18 @@ pub struct AdminProjectInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KekRotationSweepStatus {
+    pub id: String,
+    pub status: String,
+    pub target_kek_version: i32,
+    pub total_projects: i32,
+    pub rotated_projects: i32,
+    pub error: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetSystemRoleRequest {
     pub system_role: String,
 }

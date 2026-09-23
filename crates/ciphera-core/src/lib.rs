@@ -258,6 +258,43 @@ pub struct CreateTokenResponse {
     pub expires_at: Option<String>,
 }
 
+/// A registered OIDC trust policy: presenting a verified token from
+/// `issuer` with `audience` and claims matching `claims_matcher` exchanges
+/// for a service token scoped to `project_id`/`environment`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateOidcTrustPolicyRequest {
+    pub issuer: String,
+    pub audience: String,
+    /// Exact-match claim requirements; a leading/trailing `*` in the
+    /// expected value glob-matches (e.g. `"refs/heads/*"`).
+    #[serde(default)]
+    pub claims_matcher: serde_json::Map<String, serde_json::Value>,
+    pub environment: String,
+    pub ttl_seconds: i64,
+    #[serde(default)]
+    pub allowed_cidrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcTrustPolicyInfo {
+    pub id: String,
+    pub issuer: String,
+    pub audience: String,
+    pub claims_matcher: serde_json::Map<String, serde_json::Value>,
+    pub environment: String,
+    pub ttl_seconds: i64,
+    pub allowed_cidrs: Vec<String>,
+    pub created_by: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcTokenExchangeRequest {
+    pub token: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLogItem {
     pub id: String,

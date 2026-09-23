@@ -31,9 +31,25 @@ fn cli_styles() -> clap::builder::Styles {
         .invalid(AnsiColor::Yellow.on_default())
 }
 
+const QUICK_EXAMPLES: &str = "\
+Quick examples (see `ciphera <command> --help` for the full reference):
+  ciphera login                                       # human login, opens a browser
+  ciphera init --project <id> --env development        # bind this directory to a project/env
+  ciphera run --env development -- npm start            # inject secrets, exec the command
+  ciphera token create --name ci-deploy --project <id> --env production --ttl-days 90
+                                                        # machine token for CI/CD, always expires
+  ciphera doctor                                        # check auth, API reachability, keyring
+
+Run `ciphera --help` for the full command list.";
+
 #[derive(Parser, Debug)]
 #[command(name = "ciphera")]
-#[command(about = "Ciphera Secret Management System CLI", version, styles = cli_styles())]
+#[command(
+    about = "Ciphera Secret Management System CLI",
+    after_help = QUICK_EXAMPLES,
+    version,
+    styles = cli_styles()
+)]
 struct Cli {
     #[arg(
         long,
@@ -144,6 +160,27 @@ Examples:
     Token {
         #[command(subcommand)]
         command: TokenCommands,
+    },
+
+    /// Manage OIDC trust policies (exchange a CI/CD-provided OIDC token for
+    /// a service token, without a static credential)
+    #[command(long_about = "\
+Manage OIDC trust policies: an admin registers which external OIDC issuer, \
+audience and claims are trusted, and CI/CD then exchanges its own OIDC \
+token (e.g. from an identity provider your infrastructure already trusts) \
+for a normal, short-lived Ciphera service token via `ciphera token \
+oidc-exchange` — no static, never-expiring credential needs to be stored \
+in CI at all.
+
+Examples:
+  ciphera oidc-policy create --project my-project --env production \\
+      --issuer https://auth.example.com --audience ciphera \\
+      --claim sub=ci-deploy-bot --ttl-seconds 900
+  ciphera oidc-policy list --project my-project
+  ciphera oidc-policy revoke --project my-project --id <policy-id>")]
+    OidcPolicy {
+        #[command(subcommand)]
+        command: OidcPolicyCommands,
     },
 
     /// Rollback a secret to a previous version
@@ -320,7 +357,9 @@ enum SecretCommands {
 enum TokenCommands {
     /// Create a service token for machine authentication
     #[command(long_about = "\
-Create a scoped, expiring machine (service) token. This is the correct \
+Create a scoped, expiring machine (service) token. `--project` accepts a project \
+name or UUID (the UUID is resolved automatically when a name is provided). \
+This is the correct \
 credential for CI/CD, a VPS, a container, or any other non-interactive \
 context — never `ciphera login`'s device flow, which is for a human at a \
 keyboard and must not be scripted.
@@ -331,8 +370,8 @@ server) and can optionally be locked to specific source IPs \
 is known and stable.
 
 Examples:
-  ciphera token create --name ci-deploy --env production
-  ciphera token create --name vps-app --env production --ttl-days 90 \\
+  ciphera token create --name ci-deploy --project my-project --env production
+  ciphera token create --name vps-app --project my-project --env production --ttl-days 90 \\
       --allow-cidr 203.0.113.4/32")]
     Create {
         #[arg(short, long)]
@@ -353,6 +392,78 @@ Examples:
         /// omit to leave the token unrestricted by IP.
         #[arg(long = "allow-cidr")]
         allow_cidrs: Vec<String>,
+    },
+
+    /// Exchange a CI/CD-provided OIDC token for a service token
+    #[command(long_about = "\
+Exchange an externally-signed OIDC token for a normal, short-lived Ciphera \
+service token, per a trust policy an Owner/Admin already registered with \
+`ciphera oidc-policy create`. Not session-authenticated: the OIDC token \
+itself is the credential, so this works with no prior `ciphera login`.
+
+Reads the token from --oidc-token, or the CIPHERA_OIDC_TOKEN env var if \
+--oidc-token is omitted — prefer the env var in CI so the raw token never \
+appears as a literal argument in a process listing.
+
+Example (GitHub Actions, after requesting an OIDC token into $ID_TOKEN):
+  export CIPHERA_OIDC_TOKEN=\"$ID_TOKEN\"
+  ciphera token oidc-exchange")]
+    OidcExchange {
+        #[arg(
+            long = "oidc-token",
+            env = "CIPHERA_OIDC_TOKEN",
+            hide_env_values = true
+        )]
+        oidc_token: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OidcPolicyCommands {
+    /// Register a trusted OIDC issuer/audience/claims combination
+    Create {
+        #[arg(short, long)]
+        project: Option<String>,
+
+        #[arg(short, long)]
+        env: Option<String>,
+
+        /// The trusted issuer's URL, e.g. https://auth.example.com
+        #[arg(long)]
+        issuer: String,
+
+        /// The `aud` claim a presented token must carry
+        #[arg(long)]
+        audience: String,
+
+        /// A required claim as key=value; repeatable. The value may use a
+        /// leading/trailing '*' as a glob (e.g. --claim ref=refs/heads/*).
+        #[arg(long = "claim")]
+        claims: Vec<String>,
+
+        /// Lifetime, in seconds, of service tokens minted through this
+        /// policy (default: 900 = 15 minutes).
+        #[arg(long, default_value_t = 900)]
+        ttl_seconds: i64,
+
+        /// CIDR the minted token may be used from. Repeatable.
+        #[arg(long = "allow-cidr")]
+        allow_cidrs: Vec<String>,
+    },
+
+    /// List OIDC trust policies for a project
+    List {
+        #[arg(short, long)]
+        project: Option<String>,
+    },
+
+    /// Revoke an OIDC trust policy
+    Revoke {
+        #[arg(short, long)]
+        project: Option<String>,
+
+        #[arg(long)]
+        id: String,
     },
 }
 
@@ -440,6 +551,46 @@ async fn main() {
                         allow_cidrs,
                     )
                     .await
+                }
+                Err(e) => Err(e),
+            },
+            TokenCommands::OidcExchange { oidc_token } => {
+                commands::handle_oidc_exchange(&api_url, &oidc_token).await
+            }
+        },
+        Commands::OidcPolicy { command } => match command {
+            OidcPolicyCommands::Create {
+                project,
+                env,
+                issuer,
+                audience,
+                claims,
+                ttl_seconds,
+                allow_cidrs,
+            } => match resolve_token(cli.token) {
+                Ok(token) => {
+                    commands::handle_oidc_policy_create(
+                        &api_url,
+                        &token,
+                        &issuer,
+                        &audience,
+                        &claims,
+                        project,
+                        env,
+                        ttl_seconds,
+                        allow_cidrs,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            },
+            OidcPolicyCommands::List { project } => match resolve_token(cli.token) {
+                Ok(token) => commands::handle_oidc_policy_list(&api_url, &token, project).await,
+                Err(e) => Err(e),
+            },
+            OidcPolicyCommands::Revoke { project, id } => match resolve_token(cli.token) {
+                Ok(token) => {
+                    commands::handle_oidc_policy_revoke(&api_url, &token, project, &id).await
                 }
                 Err(e) => Err(e),
             },

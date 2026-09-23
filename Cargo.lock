@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "ciphera-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "axum",
  "chrono",
@@ -464,11 +464,12 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "uuid",
 ]
 
 [[package]]
 name = "ciphera-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",

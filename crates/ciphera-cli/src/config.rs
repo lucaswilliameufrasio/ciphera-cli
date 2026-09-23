@@ -146,7 +146,7 @@ pub async fn resolve_context(
         .or_else(|| env::var("CIPHERA_PROJECT_ID").ok())
         .or_else(|| file_config.as_ref().map(|c| c.project.id.clone()))
     {
-        Some(id) => id,
+        Some(project) => crate::interactive::resolve_project(api_url, token, &project).await?,
         None => {
             selected_interactively = true;
             crate::interactive::select_project(api_url, token).await?
@@ -219,12 +219,12 @@ mod tests {
         let (project, environment) = resolve_context(
             "http://localhost:1",
             "token",
-            Some("proj_flag".to_string()),
+            Some("00000000-0000-0000-0000-000000000001".to_string()),
             Some("staging".to_string()),
         )
         .await
         .unwrap();
-        assert_eq!(project, "proj_flag");
+        assert_eq!(project, "00000000-0000-0000-0000-000000000001");
         assert_eq!(environment, "staging");
     }
 
