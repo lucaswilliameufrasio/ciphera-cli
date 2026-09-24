@@ -16,8 +16,6 @@ fn hostname_label() -> Option<String> {
 }
 
 use clap::{Parser, Subcommand};
-use keyring::Entry;
-use std::env;
 
 fn cli_styles() -> clap::builder::Styles {
     use clap::builder::styling::AnsiColor;
@@ -467,19 +465,6 @@ enum OidcPolicyCommands {
     },
 }
 
-pub(crate) fn resolve_token(cli_token: Option<String>) -> Result<String, String> {
-    if let Some(t) = cli_token {
-        return Ok(t);
-    }
-    if let Ok(t) = env::var("CIPHERA_TOKEN") {
-        return Ok(t);
-    }
-    if let Ok(stored) = Entry::new("ciphera", "session_token").and_then(|e| e.get_password()) {
-        return Ok(stored);
-    }
-    Err("Not authenticated. Set CIPHERA_TOKEN, run `ciphera login`, or pass --token.".to_string())
-}
-
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -511,27 +496,33 @@ async fn main() {
         Commands::Logout => commands::handle_logout(&api_url).await,
         Commands::Init { project, env } => commands::handle_init(&project, env.as_deref()),
         Commands::Project { command } => match command {
-            ProjectCommands::Create { name } => match resolve_token(cli.token) {
-                Ok(token) => commands::handle_project_create(&api_url, &token, &name).await,
-                Err(e) => Err(e),
-            },
+            ProjectCommands::Create { name } => {
+                match commands::resolve_token(&api_url, cli.token).await {
+                    Ok(token) => commands::handle_project_create(&api_url, &token, &name).await,
+                    Err(e) => Err(e),
+                }
+            }
         },
         Commands::Config { command } => match command {
             ConfigCommands::SetApiUrl { url } => commands::handle_config_set_api_url(&url),
             ConfigCommands::Show => commands::handle_config_show(cli.api_url.as_deref()),
         },
         Commands::Secret { command } => match command {
-            SecretCommands::Delete { key, project, env } => match resolve_token(cli.token) {
-                Ok(token) => {
-                    commands::handle_secret_delete(&api_url, &token, &key, project, env).await
+            SecretCommands::Delete { key, project, env } => {
+                match commands::resolve_token(&api_url, cli.token).await {
+                    Ok(token) => {
+                        commands::handle_secret_delete(&api_url, &token, &key, project, env).await
+                    }
+                    Err(e) => Err(e),
                 }
+            }
+        },
+        Commands::Import { file, project, env } => {
+            match commands::resolve_token(&api_url, cli.token).await {
+                Ok(token) => commands::handle_import(&api_url, &token, &file, project, env).await,
                 Err(e) => Err(e),
-            },
-        },
-        Commands::Import { file, project, env } => match resolve_token(cli.token) {
-            Ok(token) => commands::handle_import(&api_url, &token, &file, project, env).await,
-            Err(e) => Err(e),
-        },
+            }
+        }
         Commands::Token { command } => match command {
             TokenCommands::Create {
                 name,
@@ -539,7 +530,7 @@ async fn main() {
                 env,
                 ttl_days,
                 allow_cidrs,
-            } => match resolve_token(cli.token) {
+            } => match commands::resolve_token(&api_url, cli.token).await {
                 Ok(token) => {
                     commands::handle_token_create(
                         &api_url,
@@ -567,7 +558,7 @@ async fn main() {
                 claims,
                 ttl_seconds,
                 allow_cidrs,
-            } => match resolve_token(cli.token) {
+            } => match commands::resolve_token(&api_url, cli.token).await {
                 Ok(token) => {
                     commands::handle_oidc_policy_create(
                         &api_url,
@@ -584,42 +575,48 @@ async fn main() {
                 }
                 Err(e) => Err(e),
             },
-            OidcPolicyCommands::List { project } => match resolve_token(cli.token) {
-                Ok(token) => commands::handle_oidc_policy_list(&api_url, &token, project).await,
-                Err(e) => Err(e),
-            },
-            OidcPolicyCommands::Revoke { project, id } => match resolve_token(cli.token) {
-                Ok(token) => {
-                    commands::handle_oidc_policy_revoke(&api_url, &token, project, &id).await
+            OidcPolicyCommands::List { project } => {
+                match commands::resolve_token(&api_url, cli.token).await {
+                    Ok(token) => commands::handle_oidc_policy_list(&api_url, &token, project).await,
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
+            OidcPolicyCommands::Revoke { project, id } => {
+                match commands::resolve_token(&api_url, cli.token).await {
+                    Ok(token) => {
+                        commands::handle_oidc_policy_revoke(&api_url, &token, project, &id).await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         },
         Commands::Rollback {
             key,
             target_version,
             project,
             env,
-        } => match resolve_token(cli.token) {
+        } => match commands::resolve_token(&api_url, cli.token).await {
             Ok(token) => {
                 commands::handle_rollback(&api_url, &token, &key, target_version, project, env)
                     .await
             }
             Err(e) => Err(e),
         },
-        Commands::Audit { project, limit } => match resolve_token(cli.token) {
-            Ok(token) => commands::handle_audit(&api_url, &token, project, limit).await,
-            Err(e) => Err(e),
-        },
+        Commands::Audit { project, limit } => {
+            match commands::resolve_token(&api_url, cli.token).await {
+                Ok(token) => commands::handle_audit(&api_url, &token, project, limit).await,
+                Err(e) => Err(e),
+            }
+        }
         Commands::Run {
             project,
             env,
             command,
-        } => match resolve_token(cli.token) {
+        } => match commands::resolve_token(&api_url, cli.token).await {
             Ok(token) => commands::handle_run(&api_url, &token, project, env, command).await,
             Err(e) => Err(e),
         },
-        Commands::Devices { command } => match resolve_token(cli.token) {
+        Commands::Devices { command } => match commands::resolve_token(&api_url, cli.token).await {
             Ok(token) => match command {
                 DeviceCommands::ListPending => {
                     commands::handle_devices_list_pending(&api_url, &token).await
@@ -638,7 +635,7 @@ async fn main() {
             Err(e) => Err(e),
         },
         Commands::Mcp { command } => match command {
-            McpCommands::Serve => match resolve_token(cli.token) {
+            McpCommands::Serve => match commands::resolve_token(&api_url, cli.token).await {
                 Ok(token) => mcp::serve(api_url, token).await,
                 Err(e) => Err(e),
             },
@@ -649,7 +646,7 @@ async fn main() {
                 env,
             } => match mcp::install::install(dry_run) {
                 Ok(()) if dry_run => Ok(()),
-                Ok(()) => match resolve_token(cli.token) {
+                Ok(()) => match commands::resolve_token(&api_url, cli.token).await {
                     Ok(token) => {
                         mcp::install::migrate_opencode(&api_url, &token, project, env, yes).await
                     }

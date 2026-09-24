@@ -4,6 +4,7 @@ use crate::config::{
 };
 use crate::env_parser::parse_env_file;
 use crate::uploader::Uploader;
+use base64::Engine as _;
 use ciphera_core::auth::AuthTokens;
 use ciphera_core::{
     AuditLogItem, CreateOidcTrustPolicyRequest, CreateProjectRequest, CreateProjectResponse,
@@ -12,7 +13,130 @@ use ciphera_core::{
 };
 use keyring::Entry;
 use reqwest::Client;
+use std::env;
 use std::process::Command;
+
+/// Refresh proactively once the access token has this many seconds or less
+/// left, so a request never races an expiry that lands mid-flight.
+const TOKEN_REFRESH_SKEW_SECONDS: i64 = 30;
+
+/// Best-effort read of a JWT's `exp` claim, without verifying the signature
+/// (the server is the source of truth on validity; this is only used to
+/// decide whether it's worth trying a proactive refresh). Returns `None` for
+/// anything that isn't a 3-part JWT with a numeric `exp` (e.g. an opaque
+/// service token), in which case the caller should use the token as-is and
+/// let the API reject it if it's actually invalid.
+fn decode_jwt_exp(token: &str) -> Option<i64> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    value.get("exp")?.as_i64()
+}
+
+enum RefreshError {
+    /// Couldn't even reach the API (DNS, connection refused, timeout, ...).
+    Network(String),
+    /// The API rejected the refresh token itself (expired, revoked, or
+    /// invalid) — only `ciphera login` can fix this.
+    InvalidRefreshToken(String),
+    /// The API reached but returned something else unexpected.
+    Server(String),
+}
+
+async fn do_refresh(api_url: &str, refresh_token: String) -> Result<AuthTokens, RefreshError> {
+    let client = Client::new();
+    let url = format!("{}/v1/auth/refresh", api_url);
+
+    let response = client
+        .post(&url)
+        .json(&ciphera_core::auth::RefreshRequest { refresh_token })
+        .send()
+        .await
+        .map_err(|e| RefreshError::Network(e.to_string()))?;
+
+    let status = response.status();
+    if status.is_success() {
+        response
+            .json::<AuthTokens>()
+            .await
+            .map_err(|e| RefreshError::Server(format!("failed to parse refresh response: {e}")))
+    } else if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        Err(RefreshError::InvalidRefreshToken(
+            response.text().await.unwrap_or_default(),
+        ))
+    } else {
+        let err_text = response.text().await.unwrap_or_default();
+        Err(RefreshError::Server(format!("{status}: {err_text}")))
+    }
+}
+
+/// Resolves the bearer token for an API call, transparently refreshing the
+/// stored session first if it's expired or about to expire. This is what
+/// every authenticated command should call instead of reading the keyring
+/// directly, so users never have to run `ciphera refresh` by hand.
+pub async fn resolve_token(api_url: &str, cli_token: Option<String>) -> Result<String, String> {
+    if let Some(t) = cli_token {
+        return Ok(t);
+    }
+    if let Ok(t) = env::var("CIPHERA_TOKEN") {
+        return Ok(t);
+    }
+
+    let stored = match Entry::new("ciphera", "session_token").and_then(|e| e.get_password()) {
+        Ok(t) => t,
+        Err(_) => {
+            return Err(
+                "Not authenticated. Set CIPHERA_TOKEN, run `ciphera login`, or pass --token."
+                    .to_string(),
+            );
+        }
+    };
+
+    let needs_refresh = match decode_jwt_exp(&stored) {
+        Some(exp) => exp <= chrono::Utc::now().timestamp() + TOKEN_REFRESH_SKEW_SECONDS,
+        None => false,
+    };
+
+    if !needs_refresh {
+        return Ok(stored);
+    }
+
+    let refresh_token = match Entry::new("ciphera", "refresh_token").and_then(|e| e.get_password())
+    {
+        Ok(t) => t,
+        // No refresh token stored (e.g. a service token was saved via
+        // `ciphera login --token`): use the access token as-is and let the
+        // API's own 401 explain things if it's truly expired.
+        Err(_) => return Ok(stored),
+    };
+
+    match do_refresh(api_url, refresh_token).await {
+        Ok(tokens) => {
+            save_tokens(&tokens).await?;
+            Ok(tokens.access_token)
+        }
+        Err(RefreshError::InvalidRefreshToken(msg)) => Err(format!(
+            "Your session has expired and could not be refreshed automatically ({}). Run `ciphera login` to sign in again.",
+            if msg.trim().is_empty() {
+                "refresh token rejected".to_string()
+            } else {
+                msg
+            }
+        )),
+        Err(RefreshError::Network(msg)) => Err(format!(
+            "Could not reach {} to refresh your session: {}. Check your network connection or --api-url and try again; if it keeps happening, run `ciphera login`.",
+            api_url, msg
+        )),
+        Err(RefreshError::Server(msg)) => Err(format!(
+            "Automatic token refresh failed ({}). Try the command again; if it keeps failing, run `ciphera login`.",
+            msg
+        )),
+    }
+}
 
 pub fn handle_login(token: &str) -> Result<(), String> {
     let entry =
@@ -206,34 +330,33 @@ pub async fn handle_login_device(api_url: &str, device_name: Option<&str>) -> Re
     }
 }
 
+/// Manually forces a refresh. No longer needed in normal use — every
+/// authenticated command refreshes transparently via `resolve_token` — but
+/// kept for scripts/debugging.
 pub async fn handle_refresh(api_url: &str) -> Result<(), String> {
     let refresh = Entry::new("ciphera", "refresh_token")
         .and_then(|e| e.get_password())
         .map_err(|_| "No refresh token stored. Run `ciphera login` first.".to_string())?;
 
-    let client = Client::new();
-    let url = format!("{}/v1/auth/refresh", api_url);
-
-    let response = client
-        .post(&url)
-        .json(&ciphera_core::auth::RefreshRequest {
-            refresh_token: refresh,
-        })
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    if response.status().is_success() {
-        let tokens: AuthTokens = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse refresh response: {}", e))?;
-        save_tokens(&tokens).await?;
-        println!("Tokens refreshed.");
-        Ok(())
-    } else {
-        let err_text = response.text().await.unwrap_or_default();
-        Err(format!("Refresh failed: {}", err_text))
+    match do_refresh(api_url, refresh).await {
+        Ok(tokens) => {
+            save_tokens(&tokens).await?;
+            println!("Tokens refreshed.");
+            Ok(())
+        }
+        Err(RefreshError::InvalidRefreshToken(msg)) => Err(format!(
+            "Refresh failed: {}. Run `ciphera login` to sign in again.",
+            if msg.trim().is_empty() {
+                "refresh token rejected".to_string()
+            } else {
+                msg
+            }
+        )),
+        Err(RefreshError::Network(msg)) => Err(format!(
+            "Refresh failed: could not reach {}: {}",
+            api_url, msg
+        )),
+        Err(RefreshError::Server(msg)) => Err(format!("Refresh failed: {}", msg)),
     }
 }
 
@@ -856,8 +979,9 @@ pub async fn handle_doctor(api_url: &str, cli_token: Option<String>) -> Result<(
         }
     }
 
-    // 2. Token resolution (env / --token / keyring).
-    let token = match crate::resolve_token(cli_token) {
+    // 2. Token resolution (env / --token / keyring), refreshing transparently
+    // if the stored session token is expired or about to expire.
+    let token = match resolve_token(api_url, cli_token).await {
         Ok(t) => {
             println!("[ok] Auth token resolved (--token, CIPHERA_TOKEN, or OS Keyring)");
             Some(t)
